@@ -1,0 +1,221 @@
+#include "opt-A2.h"
+#include <types.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+#include <kern/wait.h>
+#include <lib.h>
+#include <syscall.h>
+#include <current.h>
+#include <proc.h>
+#include <thread.h>
+#include <addrspace.h>
+#include <copyinout.h>
+
+/* this implementation of sys__exit does not do anything with the exit code */
+  /* this needs to be fixed to get exit() and waitpid() working properly */
+
+void sys__exit(int exitcode) {
+
+  struct addrspace *as;
+  struct proc *p = curproc;
+	kprintf ("_exit called\n");  
+  DEBUG(DB_SYSCALL,"Syscall: _exit(%d)\n",exitcode);
+#if OPT_A2
+  // set exit status and code
+  curproc->exit_status = 0;
+  curproc->exit_code = exitcode;
+  if (curproc->parent != NULL) { // parent has not exited
+  kprintf ("parent is not null\n"); 
+   // delete dead children and notify living children of parent's death
+	lock_acquire(curproc->lk_process_info);  // lock to access curproc->children 
+	int num = array_num(curproc->children); 
+	kprintf ("checking %d children\n", num); 
+	struct proc *curChild;
+	bool deleteCurChild = false; 	
+	for (int i = 0; i < num; ++i) {
+		deleteCurChild = false; 
+		curChild = curproc->children->v[i]; 
+		lock_acquire(curChild->lk_process_info); 
+		curChild->parent = NULL;
+	        // check if child is a zombie process	
+		if(curChild->exit_status != -1) {
+			deleteCurChild = true; 
+		}
+		lock_release(curChild->lk_process_info);
+	        // delete zombie process
+		if (deleteCurChild) {
+			proc_destroy(curChild); 
+		}
+	}
+	lock_release(curproc->lk_process_info); // lock to access curproc->children
+	cv_signal (curproc->cv_parent_waitpid, curproc->lk_process_info); // wake up parent
+  }
+#else
+  /* for now, just include this to keep the compiler from complaining about
+     an unused variable */
+  (void)exitcode;
+#endif /* OPT_A2 */
+  KASSERT(curproc->p_addrspace != NULL);
+  as_deactivate();
+  /*
+   * clear p_addrspace before calling as_destroy. Otherwise if
+   * as_destroy sleeps (which is quite possible) when we
+   * come back we'll be calling as_activate on a
+   * half-destroyed address space. This tends to be
+   * messily fatal.
+   */
+  as = curproc_setas(NULL);
+  as_destroy(as);
+
+  /* detach this thread from its process */
+  /* note: curproc cannot be used after this call */
+  proc_remthread(curthread);
+
+  /* if this is the last user process in the system, proc_destroy()
+     will wake up the kernel menu thread */
+  proc_destroy(p);
+  
+  thread_exit();
+  /* thread_exit() does not return, so we should never get here */
+  panic("return from thread_exit in sys_exit\n");
+}
+
+
+/* stub handler for getpid() system call                */
+int
+sys_getpid(pid_t *retval)
+{
+#if OPT_A2
+  *retval = curproc->PID; 
+#else
+  /* for now, this is just a stub that always returns a PID of 1 */
+  /* you need to fix this to make it work properly */
+  *retval = 1;
+#endif /* OPT_A2 */ 
+  return(0);
+}
+
+/* stub handler for waitpid() system call                */
+
+int
+sys_waitpid(pid_t pid,
+	    userptr_t status,
+	    int options,
+	    pid_t *retval)
+{
+	 if (options != 0) {
+    		return(EINVAL);
+   	 }
+	 int exitstatus;
+  	 int result;
+
+
+#if OPT_A2
+	lock_acquire(curproc->lk_process_info);
+	// check if called process is child process
+	int children_count = array_num(curproc->children);
+        bool found = false;
+        struct proc *curChild = NULL; 	
+	for (int i = 0; i < children_count; ++i) {
+		curChild = curproc->children->v[i]; 
+		if(curChild->PID == pid) {
+	 		found = true;
+			break; 	
+		}
+	}	      
+        if (!found) {
+		lock_release(curproc->lk_process_info); 
+		return ECHILD; 
+	}
+	
+	while (curChild->exit_status == -1) { 
+		cv_wait (curChild->cv_parent_waitpid, curChild->lk_process_info);  
+	}
+	exitstatus = _MKWAIT_EXIT(curChild->exit_status); 
+	lock_release(curproc->lk_process_info);
+        
+	// fully delete child here after waitpid has been called
+	proc_destroy(curChild); 	
+	return 0; 
+#else
+  /* this is just a stub implementation that always reports an
+     exit status of 0, regardless of the actual exit status of
+     the specified process.   
+     In fact, this will return 0 even if the specified process
+     is still running, and even if it never existed in the first place.
+
+     Fix this!
+  */
+
+
+  /* for now, just pretend the exitstatus is 0 */
+  exitstatus = 0;
+#endif /* OPT_A2 */
+  result = copyout((void *)&exitstatus,status,sizeof(int));
+  if (result) {
+    return(result);
+  }
+  *retval = pid;
+  return(0);
+}
+
+#if OPT_A2 
+#include "mips/trapframe.h" // to add definition of trapframe in
+
+// tf is the trapframe passed in from the system call dispatcher
+int sys_fork (struct trapframe *tf, pid_t *retval){
+	struct proc *child = proc_create_runprogram(curproc->p_name); 
+	// proc_create_runprogram will also add PID, and initialize children
+	if (child == NULL) {
+		return ENOMEM; 
+	}
+
+	// add child's parent
+	child->parent = curproc; 
+	if(child->children==NULL) {
+	       return ENOMEM; // not enough memory to create dynamic array to store children 
+	}	       
+	int status; // stores all return values 
+	array_add(curproc->children, child, (unsigned *)&status);
+        
+	
+	if(status) {
+		return ENOMEM; 
+	}
+
+	// copy address space
+	struct addrspace *child_as; 
+	status = as_copy(curproc->p_addrspace, &child_as); 
+	if (status != 0) {
+		proc_destroy(child); 
+		as_destroy(child_as); 
+		return ENOMEM; 
+	}
+	// safely attach to child->p_addrspace
+	spinlock_acquire(&child->p_lock); 
+	child->p_addrspace = child_as; // since child's addr was initialized to NULL
+	spinlock_release(&child->p_lock);
+
+	// place parent's stack frame in the heap
+	struct trapframe *tf_backup = kmalloc(sizeof(struct trapframe)); 	
+	if (tf_backup == NULL) {
+		proc_destroy(child); 
+		as_destroy(child_as); 
+		return ENOMEM; 
+	}	
+	*tf_backup = *(struct trapframe *)tf; // copy values
+
+	// create child's thread
+	void (*f_ptr)(void * data1, unsigned long data2) = (void *)&enter_forked_process; 
+	status = thread_fork (child->p_name, child, f_ptr, tf_backup, 0);
+	if (status) { // if an error occurs -> status != 0
+		proc_destroy(child);
+		as_destroy(child_as); 
+		kfree (tf_backup); 
+		return status; // return the error returned by thread_fork
+	}	
+	*retval = child->PID; 
+	return 0;
+}
+#endif /* OPT_A2 */
+
